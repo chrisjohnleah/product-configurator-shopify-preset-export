@@ -125,6 +125,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             'Product Categories',
             'Product Tags',
             'Product Permalink',
+            'Product Description (HTML)',
             'Product Featured Image',
             'Variant Price',
             'Variant Price (Raw)',
@@ -1433,6 +1434,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $product_categories        = '';
                 $product_tags              = '';
                 $product_permalink         = '';
+                $product_desc_html         = '';
                 $product_featured_image    = '';
 
                 if ($product instanceof \WC_Product) {
@@ -1470,6 +1472,11 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                         $product_tags = implode('|', array_map('sanitize_text_field', $tags));
                     }
 
+                    $description_raw = $product->get_description();
+                    if ($description_raw !== '') {
+                        $product_desc_html = wp_kses_post($description_raw);
+                    }
+
                     $image_id = $product->get_image_id();
                     if ($image_id) {
                         $url = wp_get_attachment_url($image_id);
@@ -1503,6 +1510,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                     'Product Categories'                     => $product_categories,
                     'Product Tags'                           => $product_tags,
                     'Product Permalink'                      => $product_permalink,
+                    'Product Description (HTML)'             => $product_desc_html,
                     'Product Featured Image'                 => $product_featured_image,
                     'Variant Price'                          => $variant_price_formatted,
                     'Variant Price (Raw)'                    => number_format((float) $variant_price_raw, $price_decimals, '.', ''),
