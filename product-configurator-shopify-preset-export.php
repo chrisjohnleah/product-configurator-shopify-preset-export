@@ -662,50 +662,30 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $this->send_no_presets_response();
             }
 
+            $this->prime_preset_caches($presets);
+
             $grouped = $this->group_presets_by_product($presets);
 
             if (empty($grouped)) {
                 $this->send_no_presets_response();
             }
 
-            $rows = [];
+            if ('all' === $scope) {
+                $headers = apply_filters('mkl_pc_preset_export_csv_headers', self::CSV_HEADERS);
+                $output  = $this->open_csv_stream($headers, 'preset-export');
 
-            foreach ($grouped as $product_id => $preset_posts) {
-                $product = wc_get_product($product_id);
-
-                if (! $product) {
-                    continue;
-                }
-
-                $variants = [];
-
-                $seen_variant_keys = [];
-
-                foreach ($preset_posts as $preset_post) {
-                    $variant_payload = $this->build_variant_payload($product, $preset_post);
-
-                    if (! $variant_payload) {
-                        continue;
+                $this->process_shopify_groups($grouped, function (array $row) use ($output, $headers) {
+                    $filtered_rows = apply_filters('mkl_pc_preset_export_rows', [$row]);
+                    foreach ($filtered_rows as $filtered_row) {
+                        $this->write_csv_row($output, $headers, $filtered_row);
                     }
+                });
 
-                    $variant_key = isset($variant_payload['variant_key']) ? (string) $variant_payload['variant_key'] : '';
-                    if ($variant_key !== '') {
-                        if (isset($seen_variant_keys[$variant_key])) {
-                            continue;
-                        }
-                        $seen_variant_keys[$variant_key] = true;
-                    }
-
-                    $variants[] = $variant_payload;
-                }
-
-                if (empty($variants)) {
-                    continue;
-                }
-
-                $rows = array_merge($rows, $this->format_product_rows($product, $variants));
+                fclose($output);
+                exit;
             }
 
+            $rows = $this->process_shopify_groups($grouped);
             if (empty($rows)) {
                 $this->send_no_presets_response();
             }
@@ -756,6 +736,23 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
 
             if (empty($presets)) {
                 $this->send_no_presets_response();
+            }
+
+            $this->prime_preset_caches($presets);
+
+            if ('all' === $scope) {
+                $headers = apply_filters('mkl_pc_preset_export_csv_headers', self::RAW_CSV_HEADERS);
+                $output  = $this->open_csv_stream($headers, 'preset-raw-export');
+
+                $this->build_raw_export_rows($presets, function (array $row) use ($output, $headers, $presets) {
+                    $filtered_rows = apply_filters('mkl_pc_preset_raw_export_rows', [$row], $presets);
+                    foreach ($filtered_rows as $filtered_row) {
+                        $this->write_csv_row($output, $headers, $filtered_row);
+                    }
+                });
+
+                fclose($output);
+                exit;
             }
 
             $rows = $this->build_raw_export_rows($presets);
@@ -906,7 +903,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
              * @param int    $per_page     Items per page (when scope is page).
              * @param int    $paged        Current page (when scope is page).
              */
-            return apply_filters('mkl_pc_preset_export_query_args', $args, $filters, $selected_ids, $scope, $per_page, $paged);
+            return apply_filters('mkl_pc_preset_export_query_args', $args, $filters, $selected_ids, $scope, $per_page, $paged, $page_ids);
         }
 
         /**
@@ -1176,6 +1173,33 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
         }
 
         /**
+         * Prime object caches for presets to reduce subsequent queries.
+         *
+         * @param array<int,\WP_Post> $presets
+         */
+        private function prime_preset_caches(array $presets): void
+        {
+            if (empty($presets)) {
+                return;
+            }
+
+            $ids = [];
+            foreach ($presets as $preset) {
+                if ($preset instanceof \WP_Post) {
+                    $ids[] = (int) $preset->ID;
+                }
+            }
+
+            if (! empty($ids)) {
+                update_postmeta_cache($ids);
+            }
+
+            if (function_exists('update_post_caches')) {
+                update_post_caches($presets, 'mkl_pc_configuration', false, true);
+            }
+        }
+
+        /**
          * Group presets by their parent WooCommerce product ID.
          *
          * @param array<\WP_Post> $presets
@@ -1203,12 +1227,74 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
         }
 
         /**
+         * Process grouped presets into Shopify export rows, optionally streaming.
+         *
+         * @param array<int,array<\WP_Post>> $grouped
+         * @param callable|null              $row_consumer
+         * @return array<int,array<string,string>>
+         */
+        private function process_shopify_groups(array $grouped, ?callable $row_consumer = null): array
+        {
+            $rows = [];
+
+            foreach ($grouped as $product_id => $preset_posts) {
+                $product = wc_get_product($product_id);
+
+                if (! $product) {
+                    continue;
+                }
+
+                $variants          = [];
+                $seen_variant_keys = [];
+
+                foreach ($preset_posts as $preset_post) {
+                    $variant_payload = $this->build_variant_payload($product, $preset_post);
+
+                    if (! $variant_payload) {
+                        continue;
+                    }
+
+                    $variant_key = isset($variant_payload['variant_key']) ? (string) $variant_payload['variant_key'] : '';
+                    if ($variant_key !== '') {
+                        if (isset($seen_variant_keys[$variant_key])) {
+                            continue;
+                        }
+                        $seen_variant_keys[$variant_key] = true;
+                    }
+
+                    $variants[] = $variant_payload;
+                }
+
+                if (empty($variants)) {
+                    continue;
+                }
+
+                $product_rows = $this->format_product_rows($product, $variants);
+
+                if ($row_consumer) {
+                    foreach ($product_rows as $product_row) {
+                        $row_consumer($product_row);
+                    }
+                } else {
+                    $rows = array_merge($rows, $product_rows);
+                }
+            }
+
+            if ($row_consumer) {
+                return [];
+            }
+
+            return $rows;
+        }
+
+        /**
          * Build raw export rows for the provided presets.
          *
          * @param array<int,\WP_Post> $presets
+         * @param callable|null       $row_consumer
          * @return array<int,array<string,string>>
          */
-        private function build_raw_export_rows(array $presets): array
+        private function build_raw_export_rows(array $presets, ?callable $row_consumer = null): array
         {
             $rows                     = [];
             $overrides_product_price  = $this->extra_price_overrides_product_price();
@@ -1396,7 +1482,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $preset_author_id   = (int) $preset_post->post_author;
                 $preset_author_name = $preset_author_id ? get_the_author_meta('display_name', $preset_author_id) : '';
 
-                $rows[] = [
+                $row = [
                     'Preset ID'                              => (string) $preset_post->ID,
                     'Preset Title'                           => $preset_post->post_title,
                     'Preset Slug'                            => $preset_post->post_name,
@@ -1442,9 +1528,15 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                     'Preset Meta JSON'                       => $preset_meta_json,
                     'Variant Image'                          => $variant_image,
                 ];
+
+                if ($row_consumer) {
+                    $row_consumer($row);
+                } else {
+                    $rows[] = $row;
+                }
             }
 
-            return $rows;
+            return $row_consumer ? [] : $rows;
         }
 
         /**
@@ -1795,17 +1887,14 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
         }
 
         /**
-         * Output the CSV stream to the browser.
+         * Open a CSV output stream and emit headers.
          *
-         * @param array<int,array<string,string>> $rows
-         * @param array<int,string>               $headers_override
-         * @param string                          $filename_prefix
+         * @param array<int,string> $headers
+         * @param string            $filename_prefix
+         * @return resource
          */
-        private function stream_csv(array $rows, array $headers_override = [], string $filename_prefix = 'preset-export'): void
+        private function open_csv_stream(array $headers, string $filename_prefix)
         {
-            $headers = ! empty($headers_override) ? $headers_override : self::CSV_HEADERS;
-            $headers = apply_filters('mkl_pc_preset_export_csv_headers', $headers);
-
             $filename_prefix = strtolower(preg_replace('/[^a-z0-9\-_]+/', '-', $filename_prefix));
             if ('' === $filename_prefix) {
                 $filename_prefix = 'preset-export';
@@ -1834,12 +1923,42 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
 
             fputcsv($output, $headers);
 
+            return $output;
+        }
+
+        /**
+         * Write a single CSV row following the known header order.
+         *
+         * @param resource              $output
+         * @param array<int,string>     $headers
+         * @param array<string,string>  $row
+         */
+        private function write_csv_row($output, array $headers, array $row): void
+        {
+            $ordered = [];
+            foreach ($headers as $header_label) {
+                $ordered[] = isset($row[$header_label]) ? $row[$header_label] : '';
+            }
+
+            fputcsv($output, $ordered);
+        }
+
+        /**
+         * Output the CSV stream to the browser.
+         *
+         * @param array<int,array<string,string>> $rows
+         * @param array<int,string>               $headers_override
+         * @param string                          $filename_prefix
+         */
+        private function stream_csv(array $rows, array $headers_override = [], string $filename_prefix = 'preset-export'): void
+        {
+            $headers = ! empty($headers_override) ? $headers_override : self::CSV_HEADERS;
+            $headers = apply_filters('mkl_pc_preset_export_csv_headers', $headers);
+
+            $output = $this->open_csv_stream($headers, $filename_prefix);
+
             foreach ($rows as $row) {
-                $ordered = [];
-                foreach ($headers as $header_label) {
-                    $ordered[] = isset($row[$header_label]) ? $row[$header_label] : '';
-                }
-                fputcsv($output, $ordered);
+                $this->write_csv_row($output, $headers, $row);
             }
 
             fclose($output);
