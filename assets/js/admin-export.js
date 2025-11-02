@@ -22,6 +22,19 @@
         form.appendChild(input);
     }
 
+    function getPageIds() {
+        const checkboxes = document.querySelectorAll('#the-list input[type="checkbox"][name="post[]"]');
+        const ids = [];
+
+        checkboxes.forEach(function (checkbox) {
+            if (checkbox.value) {
+                ids.push(checkbox.value);
+            }
+        });
+
+        return ids;
+    }
+
     const modal = document.getElementById('mkl-preset-export-modal');
     const triggers = document.querySelectorAll('.mkl-preset-export-modal-trigger');
 
@@ -161,6 +174,11 @@
             scope = 'selection';
         }
 
+        let pageScopeIds = [];
+        if (scope === 'page') {
+            pageScopeIds = getPageIds();
+        }
+
         const form = document.createElement('form');
         form.method = 'post';
         form.action = exportUrl;
@@ -177,6 +195,10 @@
 
         if (formatValue) {
             appendHidden(form, 'export_format', formatValue);
+        }
+
+        if (pageScopeIds.length) {
+            appendHidden(form, 'page_scope_ids', pageScopeIds.join(','));
         }
 
         if (extraFields && extraFields.length) {

@@ -496,7 +496,8 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          *     filters:array,
          *     selected_ids:array<int>,
          *     export_all:bool,
-         *     product_override_id:int
+         *     product_override_id:int,
+         *     page_ids:array<int>
          * }
          */
         private function parse_export_request(): array
@@ -578,6 +579,15 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
 
             $selected_ids = $this->parse_id_list($raw_selected_ids);
 
+            $raw_page_scope_ids = '';
+            if (isset($_POST['page_scope_ids'])) {
+                $raw_page_scope_ids = wp_unslash((string) $_POST['page_scope_ids']);
+            } elseif (isset($_GET['page_scope_ids'])) {
+                $raw_page_scope_ids = wp_unslash((string) $_GET['page_scope_ids']);
+            }
+
+            $page_scope_ids = $this->parse_id_list($raw_page_scope_ids);
+
             $export_all = false;
             if (isset($_POST['export_all'])) {
                 $export_all = (bool) (int) wp_unslash($_POST['export_all']);
@@ -610,6 +620,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 'selected_ids'        => $selected_ids,
                 'export_all'          => $export_all,
                 'product_override_id' => $product_override_id,
+                'page_ids'            => $page_scope_ids,
             ];
         }
 
@@ -636,14 +647,15 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 );
             }
 
-            $context   = $this->parse_export_request();
-            $scope     = $context['scope'];
-            $per_page  = $context['per_page'];
-            $paged     = $context['paged'];
-            $filters   = $context['filters'];
+            $context      = $this->parse_export_request();
+            $scope        = $context['scope'];
+            $per_page     = $context['per_page'];
+            $paged        = $context['paged'];
+            $filters      = $context['filters'];
             $selected_ids = $context['selected_ids'];
+            $page_ids     = $context['page_ids'];
 
-            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged);
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids);
             $presets    = $this->fetch_presets($query_args);
 
             if (empty($presets)) {
@@ -737,8 +749,9 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             $paged        = $context['paged'];
             $filters      = $context['filters'];
             $selected_ids = $context['selected_ids'];
+            $page_ids     = $context['page_ids'];
 
-            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged);
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids);
             $presets    = $this->fetch_presets($query_args);
 
             if (empty($presets)) {
@@ -782,9 +795,10 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          * @param string $scope
          * @param int    $per_page
          * @param int    $paged
+         * @param array<int> $page_ids
          * @return array
          */
-        private function build_query_args(array $filters, array $selected_ids, string $scope, int $per_page, int $paged): array
+        private function build_query_args(array $filters, array $selected_ids, string $scope, int $per_page, int $paged, array $page_ids = []): array
         {
             $args = [
                 'post_type'      => 'mkl_pc_configuration',
@@ -800,9 +814,15 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $args['posts_per_page'] = max(1, count($args['post__in']));
                 $args['orderby']        = 'post__in';
             } elseif ('page' === $scope) {
-                $per_page = $per_page > 0 ? $per_page : 20;
-                $args['posts_per_page'] = $per_page;
-                $args['paged']          = max(1, $paged);
+                if (! empty($page_ids)) {
+                    $args['post__in']       = array_map('absint', $page_ids);
+                    $args['posts_per_page'] = max(1, count($args['post__in']));
+                    $args['orderby']        = 'post__in';
+                } else {
+                    $per_page = $per_page > 0 ? $per_page : 20;
+                    $args['posts_per_page'] = $per_page;
+                    $args['paged']          = max(1, $paged);
+                }
             } else { // 'all'
                 $args['posts_per_page'] = -1;
             }
