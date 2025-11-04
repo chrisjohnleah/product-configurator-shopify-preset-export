@@ -49,6 +49,8 @@
     const submitButton = modal.querySelector('[data-role="submit"]');
     const spinner = modal.querySelector('.mkl-preset-export-spinner');
     const closers = modal.querySelectorAll('[data-role="close"]');
+    const rangeStartField = modal.querySelector('[data-export-field="range_start_id"]');
+    const rangeLimitField = modal.querySelector('[data-export-field="range_limit"]');
 
     let activeTrigger = null;
 
@@ -165,6 +167,23 @@
         });
 
         const selectedIds = getSelectedIds();
+
+        let rangeStartValue = 0;
+        if (rangeStartField) {
+            const parsedStart = parseInt(rangeStartField.value, 10);
+            if (Number.isFinite(parsedStart) && parsedStart > 0) {
+                rangeStartValue = parsedStart;
+                scope = 'range';
+            }
+        }
+
+        if (rangeStartValue > 0 && rangeLimitField) {
+            const parsedLimit = parseInt(rangeLimitField.value, 10);
+            if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+                rangeLimitField.value = '200';
+            }
+        }
+
         if (scope === 'selection' && !selectedIds.length) {
             window.alert('Select at least one preset before exporting with "Only selected presets".');
             return;

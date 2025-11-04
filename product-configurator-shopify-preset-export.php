@@ -168,6 +168,9 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             'colour' => ['raw' => '', 'normalized' => '', 'slug' => ''],
         ];
 
+        /** @var int|null */
+        private $range_start_id = null;
+
         /**
          * Reset variant layer overrides to their defaults.
          */
@@ -366,7 +369,18 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                                 <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Variant layer for Option 2 (colour)', 'mkl-pc-shopify-export'); ?></span>
                                 <input type="text" class="mkl-preset-export-modal__input" data-export-field="variant_colour_layer" placeholder="<?php echo esc_attr__('Auto detect (e.g. Colour)', 'mkl-pc-shopify-export'); ?>">
                             </label>
+                            <label class="mkl-preset-export-modal__field">
+                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Start exporting from preset ID (optional)', 'mkl-pc-shopify-export'); ?></span>
+                                <input type="number" min="1" step="1" class="mkl-preset-export-modal__input" data-export-field="range_start_id" placeholder="<?php echo esc_attr__('e.g. 12000', 'mkl-pc-shopify-export'); ?>">
+                            </label>
+                            <label class="mkl-preset-export-modal__field">
+                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Number of presets to export (optional)', 'mkl-pc-shopify-export'); ?></span>
+                                <input type="number" min="1" step="1" class="mkl-preset-export-modal__input" data-export-field="range_limit" placeholder="<?php echo esc_attr__('Defaults to 200 when start ID is set', 'mkl-pc-shopify-export'); ?>">
+                            </label>
                         </div>
+                        <p class="mkl-preset-export-modal__note">
+                            <?php echo esc_html__('Supplying a start preset ID ignores current filters and exports the requested number of presets beginning from that ID.', 'mkl-pc-shopify-export'); ?>
+                        </p>
                     </div>
                     <div class="mkl-preset-export-modal__footer">
                         <button type="button" class="button button-secondary" data-role="close"><?php echo esc_html__('Cancel', 'mkl-pc-shopify-export'); ?></button>
@@ -431,6 +445,11 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                     margin: 0 0 16px;
                     color: #475569;
                     font-size: 13px;
+                }
+                .mkl-preset-export-modal__note {
+                    margin: 12px 0 0;
+                    color: #475569;
+                    font-size: 12px;
                 }
                 .mkl-preset-export-modal__field {
                     display: flex;
@@ -498,7 +517,9 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          *     selected_ids:array<int>,
          *     export_all:bool,
          *     product_override_id:int,
-         *     page_ids:array<int>
+         *     page_ids:array<int>,
+         *     range_start:int,
+         *     range_limit:int
          * }
          */
         private function parse_export_request(): array
@@ -589,6 +610,20 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
 
             $page_scope_ids = $this->parse_id_list($raw_page_scope_ids);
 
+            $range_start_id = 0;
+            if (isset($_POST['range_start_id'])) {
+                $range_start_id = absint(wp_unslash((string) $_POST['range_start_id']));
+            } elseif (isset($_GET['range_start_id'])) {
+                $range_start_id = absint(wp_unslash((string) $_GET['range_start_id']));
+            }
+
+            $range_limit = 0;
+            if (isset($_POST['range_limit'])) {
+                $range_limit = (int) wp_unslash($_POST['range_limit']);
+            } elseif (isset($_GET['range_limit'])) {
+                $range_limit = (int) wp_unslash($_GET['range_limit']);
+            }
+
             $export_all = false;
             if (isset($_POST['export_all'])) {
                 $export_all = (bool) (int) wp_unslash($_POST['export_all']);
@@ -596,12 +631,22 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $export_all = (bool) (int) wp_unslash($_GET['export_all']);
             }
 
-            $allowed_scopes = ['selection', 'page', 'all'];
+            $allowed_scopes = ['selection', 'page', 'all', 'range'];
             if (! in_array($raw_scope, $allowed_scopes, true)) {
                 $raw_scope = 'page';
             }
 
-            if ($export_all) {
+            if ($range_start_id > 0) {
+                if ($range_limit <= 0) {
+                    $range_limit = 200;
+                }
+
+                $per_page       = $range_limit;
+                $raw_scope      = 'range';
+                $export_all     = false;
+                $selected_ids   = [];
+                $page_scope_ids = [];
+            } elseif ($export_all) {
                 $raw_scope = 'all';
             } elseif (! empty($selected_ids)) {
                 $raw_scope = 'selection';
@@ -622,6 +667,8 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 'export_all'          => $export_all,
                 'product_override_id' => $product_override_id,
                 'page_ids'            => $page_scope_ids,
+                'range_start'         => $range_start_id,
+                'range_limit'         => $range_limit,
             ];
         }
 
@@ -655,9 +702,15 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             $filters      = $context['filters'];
             $selected_ids = $context['selected_ids'];
             $page_ids     = $context['page_ids'];
+            $range_start = isset($context['range_start']) ? (int) $context['range_start'] : 0;
+            $range_limit = isset($context['range_limit']) ? (int) $context['range_limit'] : 0;
 
-            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids);
-            $presets    = $this->fetch_presets($query_args);
+            if ($range_start > 0 && $range_limit <= 0) {
+                $range_limit = 200;
+            }
+
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit);
+            $presets    = $this->fetch_presets($query_args, $range_start > 0 ? $range_start : null);
 
             if (empty($presets)) {
                 $this->send_no_presets_response();
@@ -676,10 +729,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $output  = $this->open_csv_stream($headers, 'preset-export');
 
                 $this->process_shopify_groups($grouped, function (array $row) use ($output, $headers) {
-                    $filtered_rows = apply_filters('mkl_pc_preset_export_rows', [$row]);
-                    foreach ($filtered_rows as $filtered_row) {
-                        $this->write_csv_row($output, $headers, $filtered_row);
-                    }
+                    $this->write_csv_row($output, $headers, $row);
                 });
 
                 fclose($output);
@@ -731,9 +781,15 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             $filters      = $context['filters'];
             $selected_ids = $context['selected_ids'];
             $page_ids     = $context['page_ids'];
+            $range_start = isset($context['range_start']) ? (int) $context['range_start'] : 0;
+            $range_limit = isset($context['range_limit']) ? (int) $context['range_limit'] : 0;
 
-            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids);
-            $presets    = $this->fetch_presets($query_args);
+            if ($range_start > 0 && $range_limit <= 0) {
+                $range_limit = 200;
+            }
+
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit);
+            $presets    = $this->fetch_presets($query_args, $range_start > 0 ? $range_start : null);
 
             if (empty($presets)) {
                 $this->send_no_presets_response();
@@ -745,11 +801,8 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $headers = apply_filters('mkl_pc_preset_export_csv_headers', self::RAW_CSV_HEADERS);
                 $output  = $this->open_csv_stream($headers, 'preset-raw-export');
 
-                $this->build_raw_export_rows($presets, function (array $row) use ($output, $headers, $presets) {
-                    $filtered_rows = apply_filters('mkl_pc_preset_raw_export_rows', [$row], $presets);
-                    foreach ($filtered_rows as $filtered_row) {
-                        $this->write_csv_row($output, $headers, $filtered_row);
-                    }
+                $this->build_raw_export_rows($presets, function (array $row) use ($output, $headers) {
+                    $this->write_csv_row($output, $headers, $row);
                 });
 
                 fclose($output);
@@ -796,7 +849,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          * @param array<int> $page_ids
          * @return array
          */
-        private function build_query_args(array $filters, array $selected_ids, string $scope, int $per_page, int $paged, array $page_ids = []): array
+        private function build_query_args(array $filters, array $selected_ids, string $scope, int $per_page, int $paged, array $page_ids = [], int $range_start = 0, int $range_limit = 0): array
         {
             $args = [
                 'post_type'      => 'mkl_pc_configuration',
@@ -811,6 +864,10 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $args['post__in']       = array_map('absint', $selected_ids);
                 $args['posts_per_page'] = max(1, count($args['post__in']));
                 $args['orderby']        = 'post__in';
+            } elseif ('range' === $scope && $range_start > 0) {
+                $args['posts_per_page'] = $range_limit > 0 ? (int) $range_limit : 200;
+                $args['paged']          = 1;
+                $args['offset']         = 0;
             } elseif ('page' === $scope) {
                 if (! empty($page_ids)) {
                     $args['post__in']       = array_map('absint', $page_ids);
@@ -900,11 +957,14 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
              * @param array $args          Query arguments.
              * @param array $filters       Parsed filters from the source list table.
              * @param array $selected_ids  Explicitly selected preset IDs.
-             * @param string $scope        Export scope (selection, page, all).
-             * @param int    $per_page     Items per page (when scope is page).
-             * @param int    $paged        Current page (when scope is page).
-             */
-            return apply_filters('mkl_pc_preset_export_query_args', $args, $filters, $selected_ids, $scope, $per_page, $paged, $page_ids);
+         * @param string $scope        Export scope (selection, page, all, range).
+         * @param int    $per_page     Items per page (when scope is page).
+         * @param int    $paged        Current page (when scope is page).
+         * @param array<int> $page_ids IDs captured for the current page scope.
+         * @param int    $range_start  Starting preset ID when range scope is active.
+         * @param int    $range_limit  Number of presets to export when range scope is active.
+         */
+            return apply_filters('mkl_pc_preset_export_query_args', $args, $filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit);
         }
 
         /**
@@ -1168,9 +1228,54 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          * @param array $query_args
          * @return array<\WP_Post>
          */
-        private function fetch_presets(array $query_args): array
+        private function fetch_presets(array $query_args, ?int $range_start = null): array
         {
-            return get_posts($query_args);
+            if ($range_start && $range_start > 0) {
+                $this->range_start_id = $range_start;
+                add_filter('posts_where', [$this, 'filter_posts_where_range'], 10, 2);
+            }
+
+            $posts = get_posts($query_args);
+
+            if ($range_start && $range_start > 0) {
+                remove_filter('posts_where', [$this, 'filter_posts_where_range'], 10);
+                $this->range_start_id = null;
+            }
+
+            return $posts;
+        }
+
+        /**
+         * Constrain queries to IDs >= range start when requested.
+         *
+         * @param string    $where
+         * @param \WP_Query $query
+         * @return string
+         */
+        public function filter_posts_where_range(string $where, \WP_Query $query): string
+        {
+            if (! $this->range_start_id) {
+                return $where;
+            }
+
+            $post_type = $query->get('post_type');
+            $applies   = false;
+
+            if (is_array($post_type)) {
+                $applies = in_array('mkl_pc_configuration', $post_type, true);
+            } else {
+                $applies = ('mkl_pc_configuration' === $post_type);
+            }
+
+            if (! $applies) {
+                return $where;
+            }
+
+            global $wpdb;
+
+            $where .= $wpdb->prepare(" AND {$wpdb->posts}.ID >= %d", $this->range_start_id);
+
+            return $where;
         }
 
         /**
@@ -1273,7 +1378,8 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $product_rows = $this->format_product_rows($product, $variants);
 
                 if ($row_consumer) {
-                    foreach ($product_rows as $product_row) {
+                    $filtered_rows = apply_filters('mkl_pc_preset_export_rows', $product_rows);
+                    foreach ($filtered_rows as $product_row) {
                         $row_consumer($product_row);
                     }
                 } else {
@@ -1538,7 +1644,10 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 ];
 
                 if ($row_consumer) {
-                    $row_consumer($row);
+                    $filtered_rows = apply_filters('mkl_pc_preset_raw_export_rows', [$row], $presets);
+                    foreach ($filtered_rows as $filtered_row) {
+                        $row_consumer($filtered_row);
+                    }
                 } else {
                     $rows[] = $row;
                 }
