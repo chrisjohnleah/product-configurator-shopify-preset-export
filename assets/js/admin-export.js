@@ -297,4 +297,265 @@
             startExport();
         });
     }
+
+    const deleteModal = document.getElementById('mkl-preset-delete-modal');
+    const deleteTriggers = document.querySelectorAll('.mkl-preset-delete-modal-trigger');
+
+    if (deleteModal && deleteTriggers.length) {
+        const deleteDialog = deleteModal.querySelector('.mkl-preset-export-modal__dialog');
+        const deleteScopeRadios = deleteModal.querySelectorAll('input[name="mkl-preset-delete-scope"]');
+        const deleteFields = deleteModal.querySelectorAll('[data-delete-field]');
+        const deleteSubmitButton = deleteModal.querySelector('[data-role="delete-submit"]');
+        const deleteSpinner = deleteModal.querySelector('.mkl-preset-delete-spinner');
+        const deleteClosers = deleteModal.querySelectorAll('[data-role="close"]');
+        const deleteRangeStartField = deleteModal.querySelector('[data-delete-field="range_start_id"]');
+        const deleteRangeLimitField = deleteModal.querySelector('[data-delete-field="range_limit"]');
+        const deletePermanentCheckbox = deleteModal.querySelector('[data-delete-permanent]');
+
+        let activeDeleteTrigger = null;
+
+        function setDeleteDefaultScope(defaultScope) {
+            deleteScopeRadios.forEach(function (radio) {
+                radio.checked = (radio.value === defaultScope);
+            });
+        }
+
+        function openDeleteModal(trigger) {
+            activeDeleteTrigger = trigger;
+
+            deleteModal.dataset.deleteUrl = trigger.dataset.deleteUrl || '';
+            deleteModal.dataset.nonce = trigger.dataset.nonce || '';
+            deleteModal.dataset.sourceQuery = trigger.dataset.sourceQuery || '';
+            deleteModal.dataset.paged = trigger.dataset.paged || '1';
+            deleteModal.dataset.perPage = trigger.dataset.perPage || '20';
+            deleteModal.dataset.defaultScope = trigger.dataset.defaultScope || 'page';
+            deleteModal.dataset.defaultAction = trigger.dataset.defaultAction || '';
+
+            if (deleteSpinner) {
+                deleteSpinner.classList.remove('is-active');
+                deleteSpinner.style.visibility = 'hidden';
+            }
+
+            if (deleteSubmitButton) {
+                deleteSubmitButton.disabled = false;
+            }
+
+            if (deletePermanentCheckbox) {
+                deletePermanentCheckbox.checked = false;
+            }
+
+            if (deleteFields && deleteFields.length) {
+                deleteFields.forEach(function (field) {
+                    field.value = '';
+                });
+            }
+
+            setDeleteDefaultScope(deleteModal.dataset.defaultScope || 'page');
+
+            deleteModal.removeAttribute('hidden');
+            deleteModal.setAttribute('aria-hidden', 'false');
+            document.body.classList.add('mkl-preset-export-modal-open');
+
+            if (deleteDialog) {
+                deleteDialog.focus();
+            }
+        }
+
+        function closeDeleteModal() {
+            const triggerToFocus = activeDeleteTrigger;
+            deleteModal.setAttribute('aria-hidden', 'true');
+            deleteModal.setAttribute('hidden', 'hidden');
+            document.body.classList.remove('mkl-preset-export-modal-open');
+            activeDeleteTrigger = null;
+
+            if (triggerToFocus) {
+                triggerToFocus.focus();
+            }
+        }
+
+        function startDelete() {
+            if (! activeDeleteTrigger) {
+                return;
+            }
+
+            const deleteUrl = deleteModal.dataset.deleteUrl || activeDeleteTrigger.dataset.deleteUrl || '';
+            const nonce = deleteModal.dataset.nonce || activeDeleteTrigger.dataset.nonce || '';
+            const sourceQuery = deleteModal.dataset.sourceQuery || activeDeleteTrigger.dataset.sourceQuery || '';
+            const paged = deleteModal.dataset.paged || activeDeleteTrigger.dataset.paged || '1';
+            const perPage = deleteModal.dataset.perPage || activeDeleteTrigger.dataset.perPage || '20';
+            const actionSlug = deleteModal.dataset.defaultAction || activeDeleteTrigger.dataset.defaultAction || '';
+
+            if (! deleteUrl || ! nonce || ! actionSlug) {
+                window.alert('Delete configuration is missing. Please refresh and try again.');
+                return;
+            }
+
+            let scope = 'page';
+            deleteScopeRadios.forEach(function (radio) {
+                if (radio.checked) {
+                    scope = radio.value;
+                }
+            });
+
+            const selectedIds = getSelectedIds();
+
+            if ('selection' === scope && ! selectedIds.length) {
+                window.alert('Select at least one preset before deleting with "Only selected presets".');
+                return;
+            }
+
+            let rangeStartValue = 0;
+            if (deleteRangeStartField) {
+                const parsedStart = parseInt(deleteRangeStartField.value, 10);
+                if (Number.isFinite(parsedStart) && parsedStart > 0) {
+                    rangeStartValue = parsedStart;
+                    scope = 'range';
+                }
+            }
+
+            if (rangeStartValue > 0 && deleteRangeLimitField) {
+                const parsedLimit = parseInt(deleteRangeLimitField.value, 10);
+                if (! Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+                    deleteRangeLimitField.value = '200';
+                }
+            }
+
+            if ('selection' !== scope && ! deleteScopeRadios.length && selectedIds.length) {
+                scope = 'selection';
+            }
+
+            let pageScopeIds = [];
+            if ('page' === scope) {
+                pageScopeIds = getPageIds();
+            }
+
+            let scopeSummary = '';
+            switch (scope) {
+                case 'selection':
+                    scopeSummary = selectedIds.length === 1 ? 'the selected preset' : selectedIds.length + ' selected presets';
+                    break;
+                case 'all':
+                    scopeSummary = 'all presets matching the current filters';
+                    break;
+                case 'range':
+                    scopeSummary = 'presets starting from ID ' + rangeStartValue;
+                    if (deleteRangeLimitField && deleteRangeLimitField.value) {
+                        scopeSummary += ' (' + deleteRangeLimitField.value + ' presets)';
+                    }
+                    break;
+                default:
+                    scopeSummary = 'all presets on this page';
+                    break;
+            }
+
+            const isPermanent = deletePermanentCheckbox && deletePermanentCheckbox.checked;
+            const confirmMessage = isPermanent
+                ? 'This will permanently delete ' + scopeSummary + '. This cannot be undone. Continue?'
+                : 'This will move ' + scopeSummary + ' to the bin. Continue?';
+
+            if (! window.confirm(confirmMessage)) {
+                return;
+            }
+
+            const form = document.createElement('form');
+            form.method = 'post';
+            form.action = deleteUrl;
+            form.style.display = 'none';
+
+            appendHidden(form, 'action', actionSlug);
+            appendHidden(form, '_wpnonce', nonce);
+            appendHidden(form, 'source_query', sourceQuery);
+            appendHidden(form, 'preset_ids', selectedIds.join(','));
+            appendHidden(form, 'scope', scope);
+            appendHidden(form, 'paged', paged);
+            appendHidden(form, 'per_page', perPage);
+            appendHidden(form, 'export_all', scope === 'all' ? '1' : '0');
+
+            if (pageScopeIds.length) {
+                appendHidden(form, 'page_scope_ids', pageScopeIds.join(','));
+            }
+
+            if (deleteFields && deleteFields.length) {
+                deleteFields.forEach(function (field) {
+                    if (! field || ! field.dataset || ! field.dataset.deleteField) {
+                        return;
+                    }
+
+                    const value = field.value || '';
+                    if (value === '') {
+                        return;
+                    }
+
+                    appendHidden(form, field.dataset.deleteField, value);
+                });
+            }
+
+            if (isPermanent) {
+                appendHidden(form, 'delete_permanently', '1');
+            }
+
+            document.body.appendChild(form);
+
+            if (deleteSubmitButton) {
+                deleteSubmitButton.disabled = true;
+            }
+
+            if (deleteSpinner) {
+                deleteSpinner.style.visibility = 'visible';
+                deleteSpinner.classList.add('is-active');
+            }
+
+            form.submit();
+
+            setTimeout(function () {
+                if (deleteSpinner) {
+                    deleteSpinner.classList.remove('is-active');
+                    deleteSpinner.style.visibility = 'hidden';
+                }
+                if (deleteSubmitButton) {
+                    deleteSubmitButton.disabled = false;
+                }
+                if (form.parentNode) {
+                    form.parentNode.removeChild(form);
+                }
+                closeDeleteModal();
+            }, 1500);
+        }
+
+        deleteTriggers.forEach(function (trigger) {
+            trigger.addEventListener('click', function (event) {
+                event.preventDefault();
+                openDeleteModal(trigger);
+            });
+        });
+
+        deleteClosers.forEach(function (closer) {
+            closer.addEventListener('click', function (event) {
+                event.preventDefault();
+                closeDeleteModal();
+            });
+        });
+
+        deleteModal.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeDeleteModal();
+            }
+        });
+
+        deleteModal.addEventListener('click', function (event) {
+            if (event.target && event.target.dataset && event.target.dataset.role === 'close') {
+                event.preventDefault();
+                closeDeleteModal();
+            }
+        });
+
+        if (deleteSubmitButton) {
+            deleteSubmitButton.addEventListener('click', function (event) {
+                event.preventDefault();
+                startDelete();
+            });
+        }
+    }
+
 })();

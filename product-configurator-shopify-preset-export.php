@@ -17,9 +17,12 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
     {
         private const ACTION_SLUG      = 'mkl_pc_export_presets_csv';
         private const RAW_ACTION_SLUG  = 'mkl_pc_export_presets_raw_csv';
+        private const DELETE_ACTION_SLUG = 'mkl_pc_bulk_delete_presets';
         private const NONCE_ACTION     = 'mkl_pc_export_presets_csv';
+        private const DELETE_NONCE_ACTION = 'mkl_pc_bulk_delete_presets';
+        private const DELETE_NOTICE_QUERY_ARG = 'mkl_pc_delete_notice';
         private const CAPABILITY       = 'manage_woocommerce';
-        private const VERSION          = '0.1.0';
+        private const VERSION          = '0.2.0';
         private const DEFAULT_SHOPIFY_CATEGORY = 'Hardware > Hardware Accessories > Tool Storage & Organization > Work Benches > Stationary Work Benches';
 
         /**
@@ -196,17 +199,306 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
 
         private function __construct()
         {
-            if (! is_admin()) {
+            $is_cli = (defined('WP_CLI') && WP_CLI);
+
+            if (! is_admin() && ! $is_cli) {
                 return;
             }
 
-            add_action('manage_posts_extra_tablenav', [$this, 'render_export_button'], 20, 1);
-            add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_assets']);
-            add_action('admin_post_' . self::ACTION_SLUG, [$this, 'handle_export']);
-            add_action('admin_post_nopriv_' . self::ACTION_SLUG, [$this, 'deny_non_privileged']);
-            add_action('admin_post_' . self::RAW_ACTION_SLUG, [$this, 'handle_raw_export']);
-            add_action('admin_post_nopriv_' . self::RAW_ACTION_SLUG, [$this, 'deny_non_privileged']);
-            add_action('admin_footer', [$this, 'render_export_modal_template']);
+            if (is_admin()) {
+                add_action('manage_posts_extra_tablenav', [$this, 'render_export_button'], 20, 1);
+                add_action('manage_posts_extra_tablenav', [$this, 'render_delete_button'], 30, 1);
+                add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_assets']);
+                add_action('admin_post_' . self::ACTION_SLUG, [$this, 'handle_export']);
+                add_action('admin_post_nopriv_' . self::ACTION_SLUG, [$this, 'deny_non_privileged']);
+                add_action('admin_post_' . self::RAW_ACTION_SLUG, [$this, 'handle_raw_export']);
+                add_action('admin_post_nopriv_' . self::RAW_ACTION_SLUG, [$this, 'deny_non_privileged']);
+                add_action('admin_footer', [$this, 'render_export_modal_template']);
+                add_action('admin_post_' . self::DELETE_ACTION_SLUG, [$this, 'handle_bulk_delete']);
+                add_action('admin_post_nopriv_' . self::DELETE_ACTION_SLUG, [$this, 'deny_non_privileged']);
+                add_action('admin_footer', [$this, 'render_delete_modal_template']);
+                add_action('restrict_manage_posts', [$this, 'render_product_filter'], 20, 2);
+                add_action('pre_get_posts', [$this, 'filter_admin_query']);
+                add_action('admin_notices', [$this, 'render_delete_notice']);
+                add_filter('removable_query_args', [$this, 'register_delete_removable_query_arg']);
+            }
+
+            if ($is_cli) {
+                $this->register_cli_commands();
+            }
+        }
+
+        /**
+         * Register WP-CLI commands for preset exports.
+         */
+        private function register_cli_commands(): void
+        {
+            if (! class_exists('\\WP_CLI')) {
+                return;
+            }
+
+            \WP_CLI::add_command('mkl-pc presets-export', [$this, 'cli_command_presets_export']);
+        }
+
+        /**
+         * WP-CLI handler for exporting presets to CSV.
+         *
+         * Usage: wp mkl-pc presets-export [shopify|raw] [--options]
+         *
+         * @param array<int,string>        $args
+         * @param array<string,mixed>      $assoc_args
+         */
+        public function cli_command_presets_export(array $args, array $assoc_args): void
+        {
+            if (! function_exists('wc_get_product')) {
+                \WP_CLI::error('WooCommerce is required for this export.');
+            }
+
+            $format = isset($args[0]) ? strtolower((string) $args[0]) : 'shopify';
+            $allowed_formats = ['shopify', 'raw'];
+            if (! in_array($format, $allowed_formats, true)) {
+                \WP_CLI::error(sprintf('Unsupported format "%s". Allowed formats: %s.', $format, implode(', ', $allowed_formats)));
+            }
+
+            $chunk_size = (int) \WP_CLI\Utils\get_flag_value($assoc_args, 'chunk-size', 500);
+            if ($chunk_size <= 0) {
+                $chunk_size = 500;
+            }
+
+            $scope         = strtolower((string) \WP_CLI\Utils\get_flag_value($assoc_args, 'scope', 'all'));
+            $allowed_scopes = ['selection', 'page', 'all', 'range'];
+            if (! in_array($scope, $allowed_scopes, true)) {
+                \WP_CLI::error(sprintf('Invalid scope "%s". Allowed scopes: %s.', $scope, implode(', ', $allowed_scopes)));
+            }
+
+            $output_target   = (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'output', '-');
+            $force_overwrite = (bool) \WP_CLI\Utils\get_flag_value($assoc_args, 'force', false);
+            $no_bom          = (bool) \WP_CLI\Utils\get_flag_value($assoc_args, 'no-bom', false);
+            $no_progress     = (bool) \WP_CLI\Utils\get_flag_value($assoc_args, 'no-progress', false);
+            $progress_mode   = strtolower((string) \WP_CLI\Utils\get_flag_value($assoc_args, 'progress', 'log'));
+            if (! in_array($progress_mode, ['log', 'bar'], true)) {
+                $progress_mode = 'log';
+            }
+
+            if ($no_progress) {
+                $progress_mode = 'none';
+            }
+
+            $per_page_flag = \WP_CLI\Utils\get_flag_value($assoc_args, 'per_page', null);
+            $paged_flag    = \WP_CLI\Utils\get_flag_value($assoc_args, 'paged', null);
+
+            $input = [
+                'scope'               => $scope,
+                'filters'             => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'filters', ''),
+                'source_query'        => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'source_query', ''),
+                'preset_ids'          => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'preset_ids', ''),
+                'page_scope_ids'      => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'page_scope_ids', ''),
+                'product_ids'         => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'product_ids', ''),
+                'variant_size_layer'  => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'variant_size_layer', ''),
+                'variant_colour_layer'=> (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'variant_colour_layer', ''),
+                'range_start_id'      => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'range_start', ''),
+                'range_limit'         => (string) \WP_CLI\Utils\get_flag_value($assoc_args, 'range_limit', ''),
+            ];
+
+            if (null !== $per_page_flag && '' !== $per_page_flag) {
+                $input['per_page'] = $per_page_flag;
+            } else {
+                $input['per_page'] = $chunk_size;
+            }
+
+            if (null !== $paged_flag && '' !== $paged_flag) {
+                $input['paged'] = $paged_flag;
+            } else {
+                $input['paged'] = 1;
+            }
+
+            $export_all_flag = \WP_CLI\Utils\get_flag_value($assoc_args, 'export_all', null);
+            if (null !== $export_all_flag && '' !== $export_all_flag) {
+                $input['export_all'] = $export_all_flag;
+            } elseif ('all' === $scope) {
+                $input['export_all'] = 1;
+            }
+
+            $output_to_stdout = ('-' === $output_target || '' === $output_target);
+            if ($output_to_stdout) {
+                $handle = fopen('php://stdout', 'wb');
+                if (! $handle) {
+                    \WP_CLI::error('Unable to open STDOUT for writing.');
+                }
+                $close_handle = false;
+                $output_label = 'STDOUT';
+            } else {
+                $output_path = wp_normalize_path($output_target);
+                $dir         = dirname($output_path);
+                if (! is_dir($dir)) {
+                    if (! wp_mkdir_p($dir)) {
+                        \WP_CLI::error(sprintf('Unable to create directory %s.', $dir));
+                    }
+                }
+
+                if (! $force_overwrite && file_exists($output_path)) {
+                    \WP_CLI::error(sprintf('Output file %s already exists. Use --force to overwrite.', $output_path));
+                }
+
+                $handle = fopen($output_path, 'wb');
+                if (! $handle) {
+                    \WP_CLI::error(sprintf('Unable to open %s for writing.', $output_path));
+                }
+                $close_handle = true;
+                $output_label = $output_path;
+            }
+
+            stream_set_write_buffer($handle, 0);
+
+            $headers = ('raw' === $format) ? self::RAW_CSV_HEADERS : self::CSV_HEADERS;
+            $headers = apply_filters('mkl_pc_preset_export_csv_headers', $headers);
+
+            if (! $no_bom) {
+                fwrite($handle, "\xEF\xBB\xBF");
+            }
+
+            if (false === fputcsv($handle, $headers)) {
+                if ($close_handle) {
+                    fclose($handle);
+                }
+                \WP_CLI::error('Failed to write CSV headers.');
+            }
+
+            $base_scope = $scope;
+            $base_input = $input;
+            $sample_context = $this->prepare_export_context($base_input);
+
+            $page = (int) $base_input['paged'];
+            if ($page <= 0) {
+                $page = 1;
+            }
+
+            $total_rows    = 0;
+            $total_presets = 0;
+            $iteration     = 0;
+            $start_time    = microtime(true);
+            $progress_bar  = null;
+            $progress_target = 0;
+
+            if ('bar' === $progress_mode) {
+                if ('range' === $base_scope && ! empty($sample_context['range_limit'])) {
+                    $progress_target = (int) $sample_context['range_limit'];
+                } elseif ('selection' === $base_scope && ! empty($sample_context['selected_ids'])) {
+                    $progress_target = count($sample_context['selected_ids']);
+                } elseif ('page' === $base_scope && ! empty($sample_context['per_page'])) {
+                    $progress_target = (int) $sample_context['per_page'];
+                }
+
+                if ($progress_target > 0) {
+                    $progress_bar = \WP_CLI\Utils\make_progress_bar('Exporting presets', $progress_target);
+                } else {
+                    $progress_mode = 'log';
+                }
+            }
+
+            $row_writer = function (array $row) use ($handle, $headers, &$progress_bar, &$total_rows): void {
+                $this->write_csv_row($handle, $headers, $row);
+                $total_rows++;
+
+                if ($progress_bar instanceof \cli\progress\Bar) {
+                    $progress_bar->tick();
+                }
+            };
+
+            do {
+                $iteration++;
+                $loop_input = $base_input;
+
+                if ('all' === $base_scope) {
+                    $loop_input['scope']          = 'page';
+                    $loop_input['per_page']       = $chunk_size;
+                    $loop_input['paged']          = $page;
+                    $loop_input['export_all']     = false;
+                    $loop_input['page_scope_ids'] = '';
+                } elseif ('page' === $base_scope) {
+                    $loop_input['per_page'] = $loop_input['per_page'] ?? $chunk_size;
+                    $loop_input['paged']    = $page;
+                }
+
+                $context = $this->prepare_export_context($loop_input);
+                $result  = $this->stream_export_rows($context, $format, $row_writer);
+
+                $batch_presets = $result['presets'];
+                $batch_rows    = $result['rows'];
+
+                if (0 === $batch_presets) {
+                    if (1 === $iteration && 0 === $total_rows) {
+                        $message = 'No presets matched the provided filters.';
+                        if ($output_to_stdout) {
+                            fwrite(STDERR, $message . "\n");
+                        } else {
+                            \WP_CLI::warning($message);
+                        }
+                    }
+                    break;
+                }
+
+                $total_presets += $batch_presets;
+                if ('log' === $progress_mode) {
+                    $message = sprintf(
+                        'Batch %d: wrote %d rows from %d presets (total rows: %d).',
+                        $iteration,
+                        $batch_rows,
+                        $batch_presets,
+                        $total_rows
+                    );
+                    if ($output_to_stdout) {
+                        fwrite(STDERR, $message . "\n");
+                    } else {
+                        \WP_CLI::log($message);
+                    }
+                }
+
+                if ('all' === $base_scope) {
+                    if ($batch_presets < $chunk_size) {
+                        break;
+                    }
+                    $page++;
+                    continue;
+                }
+
+                break;
+            } while (true);
+
+            if ($progress_bar instanceof \cli\progress\Bar) {
+                $progress_bar->finish();
+            }
+
+            if ($close_handle) {
+                fclose($handle);
+            } else {
+                fflush($handle);
+            }
+
+            if ($total_rows > 0) {
+                $duration = microtime(true) - $start_time;
+                $summary  = sprintf(
+                    'Export complete: %d rows from %d presets written to %s in %.2fs.',
+                    $total_rows,
+                    $total_presets,
+                    $output_label,
+                    $duration
+                );
+
+                if ($progress_bar instanceof \cli\progress\Bar && $progress_target > 0 && $total_rows < $progress_target) {
+                    $summary .= sprintf(' (processed %d/%d rows)', $total_rows, $progress_target);
+                }
+
+                if ($output_to_stdout) {
+                    fwrite(STDERR, $summary . "\n");
+                } else {
+                    \WP_CLI::success($summary);
+                }
+            } else {
+                if (! $output_to_stdout) {
+                    \WP_CLI::warning('No data exported.');
+                }
+            }
         }
 
         /**
@@ -277,6 +569,72 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
         }
 
         /**
+         * Render the bulk delete button alongside the export controls.
+         *
+         * @param string $which Tablenav location identifier.
+         */
+        public function render_delete_button(string $which): void
+        {
+            if ('top' !== $which) {
+                return;
+            }
+
+            $screen = get_current_screen();
+
+            if (! $screen || 'edit-mkl_pc_configuration' !== $screen->id) {
+                return;
+            }
+
+            $query_payload = [];
+
+            if (! empty($_SERVER['QUERY_STRING'])) {
+                $raw_query = wp_unslash((string) $_SERVER['QUERY_STRING']);
+                parse_str($raw_query, $query_payload);
+
+                unset(
+                    $query_payload['action'],
+                    $query_payload['action2'],
+                    $query_payload['_wpnonce'],
+                    $query_payload['ids'],
+                    $query_payload['paged']
+                );
+            }
+
+            $source_query = '';
+            if (! empty($query_payload)) {
+                $query_string = http_build_query($query_payload);
+                $source_query = base64_encode($query_string);
+            }
+
+            $paged = isset($_GET['paged']) ? max(1, (int) $_GET['paged']) : 1;
+
+            $per_page = (int) get_user_option('edit_mkl_pc_configuration_per_page', get_current_user_id());
+            if ($per_page <= 0) {
+                $per_page = (int) apply_filters('edit_posts_per_page', 20, 'mkl_pc_configuration');
+                if ($per_page <= 0) {
+                    $per_page = 20;
+                }
+            }
+
+            $nonce      = wp_create_nonce(self::DELETE_NONCE_ACTION);
+            $action_url = admin_url('admin-post.php');
+
+            echo '<div class="mkl-preset-delete-controls" style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;">';
+            echo '<button type="button" class="button button-secondary mkl-preset-delete-modal-trigger"';
+            echo ' data-delete-url="' . esc_url($action_url) . '"';
+            echo ' data-nonce="' . esc_attr($nonce) . '"';
+            echo ' data-source-query="' . esc_attr($source_query) . '"';
+            echo ' data-paged="' . esc_attr($paged) . '"';
+            echo ' data-per-page="' . esc_attr($per_page) . '"';
+            echo ' data-default-scope="page"';
+            echo ' data-default-action="' . esc_attr(self::DELETE_ACTION_SLUG) . '"';
+            echo '>';
+            echo esc_html__('Delete presets…', 'mkl-pc-shopify-export');
+            echo '</button>';
+            echo '</div>';
+        }
+
+        /**
          * Handle the CSV export request.
          */
         public function enqueue_admin_assets(string $hook_suffix): void
@@ -297,6 +655,66 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 self::VERSION,
                 true
             );
+        }
+
+        /**
+         * Add a product ID filter field to the presets list table.
+         *
+         * @param string $post_type Current post type.
+         * @param string $which     Tablenav location identifier.
+         */
+        public function render_product_filter(string $post_type, string $which): void
+        {
+            if ('mkl_pc_configuration' !== $post_type || 'top' !== $which) {
+                return;
+            }
+
+            $current_value = '';
+
+            if (isset($_GET['mkl_pc_product_id'])) {
+                $raw = wp_unslash((string) $_GET['mkl_pc_product_id']);
+                $current_value = preg_replace('/[^0-9]/', '', $raw);
+            }
+
+            $input_id = 'mkl-preset-filter-product-id';
+
+            echo '<label class="screen-reader-text" for="' . esc_attr($input_id) . '">' . esc_html__('Filter by product ID', 'mkl-pc-shopify-export') . '</label>';
+            echo '<input type="number" min="1" class="mkl-preset-filter-product-id" id="' . esc_attr($input_id) . '" name="mkl_pc_product_id" value="' . esc_attr($current_value) . '" placeholder="' . esc_attr__('Product ID', 'mkl-pc-shopify-export') . '" style="width:120px;margin-left:8px;" />';
+        }
+
+        /**
+         * Apply the product ID filter to the presets list query when requested.
+         *
+         * @param \WP_Query $query The current query object.
+         */
+        public function filter_admin_query(\WP_Query $query): void
+        {
+            if (! is_admin() || ! $query->is_main_query()) {
+                return;
+            }
+
+            $pagenow = isset($GLOBALS['pagenow']) ? $GLOBALS['pagenow'] : '';
+            if ('edit.php' !== $pagenow) {
+                return;
+            }
+
+            $queried_type = $query->get('post_type');
+            if (is_array($queried_type)) {
+                if (! in_array('mkl_pc_configuration', $queried_type, true)) {
+                    return;
+                }
+            } elseif ('mkl_pc_configuration' !== $queried_type) {
+                return;
+            }
+
+            if (isset($_GET['mkl_pc_product_id'])) {
+                $raw        = wp_unslash((string) $_GET['mkl_pc_product_id']);
+                $product_id = absint($raw);
+
+                if ($product_id > 0) {
+                    $query->set('post_parent', $product_id);
+                }
+            }
         }
 
         /**
@@ -358,8 +776,8 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                         </fieldset>
                         <div class="mkl-preset-export-modal__grid">
                             <label class="mkl-preset-export-modal__field">
-                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Filter by product ID (optional)', 'mkl-pc-shopify-export'); ?></span>
-                                <input type="number" min="1" step="1" class="mkl-preset-export-modal__input" data-export-field="variant_product_id" placeholder="<?php echo esc_attr__('e.g. 12570', 'mkl-pc-shopify-export'); ?>">
+                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Filter by product ID(s) (optional)', 'mkl-pc-shopify-export'); ?></span>
+                                <input type="text" class="mkl-preset-export-modal__input" data-export-field="product_ids" placeholder="<?php echo esc_attr__('e.g. 12570 or 12570,13000', 'mkl-pc-shopify-export'); ?>">
                             </label>
                             <label class="mkl-preset-export-modal__field">
                                 <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Variant layer for Option 1 (size)', 'mkl-pc-shopify-export'); ?></span>
@@ -507,128 +925,246 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
         }
 
         /**
-         * Parse common request parameters for any preset export.
+         * Output the modal template used for bulk deletions.
+         */
+        public function render_delete_modal_template(): void
+        {
+            $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+
+            if (! $screen || 'edit-mkl_pc_configuration' !== $screen->id) {
+                return;
+            }
+
+            static $printed_delete = false;
+
+            if ($printed_delete) {
+                return;
+            }
+
+            $printed_delete = true;
+
+            ?>
+            <div id="mkl-preset-delete-modal" class="mkl-preset-export-modal" hidden aria-hidden="true">
+                <div class="mkl-preset-export-modal__overlay" data-role="close" aria-hidden="true"></div>
+                <div class="mkl-preset-export-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="mkl-preset-delete-modal-title" tabindex="-1">
+                    <div class="mkl-preset-export-modal__header">
+                        <h2 id="mkl-preset-delete-modal-title"><?php echo esc_html__('Delete presets', 'mkl-pc-shopify-export'); ?></h2>
+                        <button type="button" class="mkl-preset-export-modal__close" data-role="close" aria-label="<?php echo esc_attr__('Close delete dialog', 'mkl-pc-shopify-export'); ?>">×</button>
+                    </div>
+                    <div class="mkl-preset-export-modal__body">
+                        <p class="mkl-preset-export-modal__intro">
+                            <?php echo esc_html__('Bulk deletion honours the filters currently applied to this list (search, dates, products, etc.). Choose the scope below and confirm to remove presets in one go.', 'mkl-pc-shopify-export'); ?>
+                        </p>
+                        <fieldset class="mkl-preset-export-modal__fieldset">
+                            <legend><?php echo esc_html__('Deletion scope', 'mkl-pc-shopify-export'); ?></legend>
+                            <label class="mkl-preset-export-modal__checkbox">
+                                <input type="radio" name="mkl-preset-delete-scope" value="page" checked="checked">
+                                <?php echo esc_html__('Current page (honours filters)', 'mkl-pc-shopify-export'); ?>
+                            </label>
+                            <label class="mkl-preset-export-modal__checkbox">
+                                <input type="radio" name="mkl-preset-delete-scope" value="selection">
+                                <?php echo esc_html__('Only selected presets', 'mkl-pc-shopify-export'); ?>
+                            </label>
+                            <label class="mkl-preset-export-modal__checkbox">
+                                <input type="radio" name="mkl-preset-delete-scope" value="all">
+                                <?php echo esc_html__('Entire filtered list (may be slow)', 'mkl-pc-shopify-export'); ?>
+                            </label>
+                        </fieldset>
+                        <div class="mkl-preset-export-modal__grid">
+                            <label class="mkl-preset-export-modal__field">
+                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Limit by product ID(s) (optional)', 'mkl-pc-shopify-export'); ?></span>
+                                <input type="text" class="mkl-preset-export-modal__input" data-delete-field="product_ids" placeholder="<?php echo esc_attr__('e.g. 12570 or 12570,13000', 'mkl-pc-shopify-export'); ?>">
+                            </label>
+                            <label class="mkl-preset-export-modal__field">
+                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Start deleting from preset ID (optional)', 'mkl-pc-shopify-export'); ?></span>
+                                <input type="number" min="1" step="1" class="mkl-preset-export-modal__input" data-delete-field="range_start_id" placeholder="<?php echo esc_attr__('e.g. 12000', 'mkl-pc-shopify-export'); ?>">
+                            </label>
+                            <label class="mkl-preset-export-modal__field">
+                                <span class="mkl-preset-export-modal__label"><?php echo esc_html__('Number of presets to delete (optional)', 'mkl-pc-shopify-export'); ?></span>
+                                <input type="number" min="1" step="1" class="mkl-preset-export-modal__input" data-delete-field="range_limit" placeholder="<?php echo esc_attr__('Defaults to 200 when start ID is set', 'mkl-pc-shopify-export'); ?>">
+                            </label>
+                        </div>
+                        <label class="mkl-preset-export-modal__checkbox">
+                            <input type="checkbox" data-delete-permanent value="1">
+                            <?php echo esc_html__('Delete permanently (skip the bin)', 'mkl-pc-shopify-export'); ?>
+                        </label>
+                        <p class="mkl-preset-export-modal__note">
+                            <?php echo esc_html__('Leaving the permanent option unchecked moves presets to the bin so they can be restored. Permanently deleting presets cannot be undone.', 'mkl-pc-shopify-export'); ?>
+                        </p>
+                    </div>
+                    <div class="mkl-preset-export-modal__footer">
+                        <button type="button" class="button button-secondary" data-role="close"><?php echo esc_html__('Cancel', 'mkl-pc-shopify-export'); ?></button>
+                        <button type="button" class="button button-primary mkl-preset-delete-submit" data-role="delete-submit" style="background:#d63638;border-color:#d63638;"><?php echo esc_html__('Delete', 'mkl-pc-shopify-export'); ?></button>
+                        <span class="spinner mkl-preset-delete-spinner" style="visibility:hidden;"></span>
+                    </div>
+                </div>
+            </div>
+            <?php
+        }
+
+        /**
+         * Display admin notices summarising bulk deletion results.
+         */
+        public function render_delete_notice(): void
+        {
+            if (! isset($_GET[self::DELETE_NOTICE_QUERY_ARG])) {
+                return;
+            }
+
+            $raw = wp_unslash((string) $_GET[self::DELETE_NOTICE_QUERY_ARG]);
+            $decoded = base64_decode(rawurldecode($raw), true);
+            if (false === $decoded || '' === $decoded) {
+                return;
+            }
+
+            $data = json_decode($decoded, true);
+            if (! is_array($data)) {
+                return;
+            }
+
+            $type  = isset($data['type']) ? (string) $data['type'] : 'success';
+            $class = 'notice notice-success is-dismissible';
+
+            if ('error' === $type) {
+                $class = 'notice notice-error is-dismissible';
+            } elseif ('warning' === $type) {
+                $class = 'notice notice-warning is-dismissible';
+            }
+
+            $message = isset($data['message']) ? (string) $data['message'] : '';
+            if ('' === $message) {
+                $deleted_count = isset($data['deleted']) ? (int) $data['deleted'] : 0;
+                $message       = sprintf(
+                    /* translators: %d: number of presets processed */
+                    _n('Processed %d preset.', 'Processed %d presets.', $deleted_count, 'mkl-pc-shopify-export'),
+                    $deleted_count
+                );
+            }
+
+            echo '<div class="' . esc_attr($class) . '"><p>' . esc_html($message) . '</p>';
+
+            if (! empty($data['failed_ids']) && is_array($data['failed_ids'])) {
+                $failed_ids = array_slice(array_map('intval', $data['failed_ids']), 0, 10);
+                if (! empty($failed_ids)) {
+                    echo '<p>' . esc_html__('Failed preset IDs:', 'mkl-pc-shopify-export') . ' ' . esc_html(implode(', ', $failed_ids));
+                    if (count($data['failed_ids']) > 10) {
+                        echo esc_html__(' …', 'mkl-pc-shopify-export');
+                    }
+                    echo '</p>';
+                }
+            }
+
+            echo '</div>';
+        }
+
+        /**
+         * Ensure the bulk delete notice query argument is removable.
          *
+         * @param array<int,string> $args
+         * @return array<int,string>
+         */
+        public function register_delete_removable_query_arg(array $args): array
+        {
+            $args[] = self::DELETE_NOTICE_QUERY_ARG;
+
+            return array_values(array_unique($args));
+        }
+
+        /**
+         * Normalise export arguments into a canonical context array.
+         *
+         * @param array<string,mixed> $input Raw export arguments.
          * @return array{
          *     scope:string,
          *     per_page:int,
          *     paged:int,
-         *     filters:array,
+         *     filters:array<string,mixed>,
          *     selected_ids:array<int>,
          *     export_all:bool,
-         *     product_override_id:int,
          *     page_ids:array<int>,
          *     range_start:int,
-         *     range_limit:int
+         *     range_limit:int,
+         *     product_ids:array<int>
          * }
          */
-        private function parse_export_request(): array
+        public function prepare_export_context(array $input): array
         {
-            $raw_scope = 'page';
-            if (isset($_POST['scope'])) {
-                $raw_scope = sanitize_key(wp_unslash($_POST['scope']));
-            } elseif (isset($_GET['scope'])) {
-                $raw_scope = sanitize_key(wp_unslash($_GET['scope']));
-            }
+            $raw_scope = isset($input['scope']) ? sanitize_key((string) $input['scope']) : 'page';
 
-            $per_page = 20;
-            if (isset($_POST['per_page'])) {
-                $per_page = (int) wp_unslash($_POST['per_page']);
-            } elseif (isset($_GET['per_page'])) {
-                $per_page = (int) wp_unslash($_GET['per_page']);
-            }
+            $per_page = isset($input['per_page']) ? (int) $input['per_page'] : 20;
             if ($per_page <= 0) {
                 $per_page = 20;
             }
 
-            $paged = 1;
-            if (isset($_POST['paged'])) {
-                $paged = max(1, (int) wp_unslash($_POST['paged']));
-            } elseif (isset($_GET['paged'])) {
-                $paged = max(1, (int) wp_unslash($_GET['paged']));
+            $paged = isset($input['paged']) ? (int) $input['paged'] : 1;
+            if ($paged <= 0) {
+                $paged = 1;
             }
 
-            $raw_source_query = '';
-            if (isset($_POST['source_query'])) {
-                $raw_source_query = wp_unslash((string) $_POST['source_query']);
-            } elseif (isset($_GET['source_query'])) {
-                $raw_source_query = wp_unslash((string) $_GET['source_query']);
-            }
-
-            $source_filters = [];
-            if ('' !== $raw_source_query) {
-                $decoded = base64_decode($raw_source_query);
-                if (false !== $decoded && '' !== $decoded) {
-                    parse_str($decoded, $source_filters);
+            $filters = [];
+            if (isset($input['filters'])) {
+                if (is_string($input['filters'])) {
+                    if ('' !== trim($input['filters'])) {
+                        parse_str($input['filters'], $filters);
+                    }
+                } elseif (is_array($input['filters'])) {
+                    $filters = $input['filters'];
                 }
             }
 
-            $product_override_id = 0;
-            if (isset($_POST['variant_product_id'])) {
-                $product_override_id = absint(wp_unslash((string) $_POST['variant_product_id']));
-            } elseif (isset($_GET['variant_product_id'])) {
-                $product_override_id = absint(wp_unslash((string) $_GET['variant_product_id']));
+            if (empty($filters) && isset($input['source_query']) && is_string($input['source_query']) && '' !== $input['source_query']) {
+                $decoded = base64_decode($input['source_query']);
+                if (false !== $decoded && '' !== $decoded) {
+                    parse_str($decoded, $filters);
+                }
             }
 
-            if ($product_override_id > 0) {
-                $source_filters['post_parent'] = $product_override_id;
+            $product_ids = [];
+            if (array_key_exists('product_ids', $input)) {
+                $product_ids = $this->parse_id_list($input['product_ids']);
             }
 
-            $size_layer_override = '';
-            if (isset($_POST['variant_size_layer'])) {
-                $size_layer_override = (string) wp_unslash($_POST['variant_size_layer']);
-            } elseif (isset($_GET['variant_size_layer'])) {
-                $size_layer_override = (string) wp_unslash($_GET['variant_size_layer']);
-            }
-
-            $colour_layer_override = '';
-            if (isset($_POST['variant_colour_layer'])) {
-                $colour_layer_override = (string) wp_unslash($_POST['variant_colour_layer']);
-            } elseif (isset($_GET['variant_colour_layer'])) {
-                $colour_layer_override = (string) wp_unslash($_GET['variant_colour_layer']);
-            }
+            $size_layer_override   = isset($input['variant_size_layer']) ? sanitize_text_field((string) $input['variant_size_layer']) : '';
+            $colour_layer_override = isset($input['variant_colour_layer']) ? sanitize_text_field((string) $input['variant_colour_layer']) : '';
 
             $this->reset_variant_layer_overrides();
             $this->set_variant_layer_override('size', $size_layer_override);
             $this->set_variant_layer_override('colour', $colour_layer_override);
 
-            $raw_selected_ids = '';
-            if (isset($_POST['preset_ids'])) {
-                $raw_selected_ids = wp_unslash((string) $_POST['preset_ids']);
-            } elseif (isset($_GET['preset_ids'])) {
-                $raw_selected_ids = wp_unslash((string) $_GET['preset_ids']);
+            $selected_ids = [];
+            if (isset($input['preset_ids'])) {
+                $selected_ids = $this->parse_id_list($input['preset_ids']);
             }
 
-            $selected_ids = $this->parse_id_list($raw_selected_ids);
-
-            $raw_page_scope_ids = '';
-            if (isset($_POST['page_scope_ids'])) {
-                $raw_page_scope_ids = wp_unslash((string) $_POST['page_scope_ids']);
-            } elseif (isset($_GET['page_scope_ids'])) {
-                $raw_page_scope_ids = wp_unslash((string) $_GET['page_scope_ids']);
+            $page_scope_ids = [];
+            if (isset($input['page_scope_ids'])) {
+                $page_scope_ids = $this->parse_id_list($input['page_scope_ids']);
             }
 
-            $page_scope_ids = $this->parse_id_list($raw_page_scope_ids);
-
-            $range_start_id = 0;
-            if (isset($_POST['range_start_id'])) {
-                $range_start_id = absint(wp_unslash((string) $_POST['range_start_id']));
-            } elseif (isset($_GET['range_start_id'])) {
-                $range_start_id = absint(wp_unslash((string) $_GET['range_start_id']));
+            $range_start = 0;
+            if (isset($input['range_start_id'])) {
+                $range_start = absint($input['range_start_id']);
+            } elseif (isset($input['range_start'])) {
+                $range_start = absint($input['range_start']);
             }
 
             $range_limit = 0;
-            if (isset($_POST['range_limit'])) {
-                $range_limit = (int) wp_unslash($_POST['range_limit']);
-            } elseif (isset($_GET['range_limit'])) {
-                $range_limit = (int) wp_unslash($_GET['range_limit']);
+            if (isset($input['range_limit'])) {
+                $range_limit = (int) $input['range_limit'];
+            }
+            if ($range_limit < 0) {
+                $range_limit = 0;
             }
 
             $export_all = false;
-            if (isset($_POST['export_all'])) {
-                $export_all = (bool) (int) wp_unslash($_POST['export_all']);
-            } elseif (isset($_GET['export_all'])) {
-                $export_all = (bool) (int) wp_unslash($_GET['export_all']);
+            if (isset($input['export_all'])) {
+                if (is_bool($input['export_all'])) {
+                    $export_all = $input['export_all'];
+                } else {
+                    $export_all = (bool) (int) $input['export_all'];
+                }
+            } elseif ('all' === $raw_scope) {
+                $export_all = true;
             }
 
             $allowed_scopes = ['selection', 'page', 'all', 'range'];
@@ -636,7 +1172,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $raw_scope = 'page';
             }
 
-            if ($range_start_id > 0) {
+            if ($range_start > 0) {
                 if ($range_limit <= 0) {
                     $range_limit = 200;
                 }
@@ -659,18 +1195,133 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             }
 
             return [
-                'scope'               => $raw_scope,
-                'per_page'            => $per_page,
-                'paged'               => $paged,
-                'filters'             => $source_filters,
-                'selected_ids'        => $selected_ids,
-                'export_all'          => $export_all,
-                'product_override_id' => $product_override_id,
-                'page_ids'            => $page_scope_ids,
-                'range_start'         => $range_start_id,
-                'range_limit'         => $range_limit,
+                'scope'        => $raw_scope,
+                'per_page'     => $per_page,
+                'paged'        => $paged,
+                'filters'      => is_array($filters) ? $filters : [],
+                'selected_ids' => $selected_ids,
+                'export_all'   => (bool) $export_all,
+                'page_ids'     => $page_scope_ids,
+                'range_start'  => $range_start,
+                'range_limit'  => $range_limit,
+                'product_ids'  => $product_ids,
             ];
         }
+
+        /**
+         * Parse export request parameters from the current HTTP request.
+         *
+         * @return array{
+         *     scope:string,
+         *     per_page:int,
+         *     paged:int,
+         *     filters:array<string,mixed>,
+         *     selected_ids:array<int>,
+         *     export_all:bool,
+         *     page_ids:array<int>,
+         *     range_start:int,
+         *     range_limit:int,
+         *     product_ids:array<int>
+         * }
+         */
+        private function parse_export_request(): array
+        {
+            $input = [];
+
+            if (isset($_POST['scope'])) {
+                $input['scope'] = wp_unslash((string) $_POST['scope']);
+            } elseif (isset($_GET['scope'])) {
+                $input['scope'] = wp_unslash((string) $_GET['scope']);
+            }
+
+            if (isset($_POST['per_page'])) {
+                $input['per_page'] = wp_unslash($_POST['per_page']);
+            } elseif (isset($_GET['per_page'])) {
+                $input['per_page'] = wp_unslash($_GET['per_page']);
+            }
+
+            if (isset($_POST['paged'])) {
+                $input['paged'] = wp_unslash($_POST['paged']);
+            } elseif (isset($_GET['paged'])) {
+                $input['paged'] = wp_unslash($_GET['paged']);
+            }
+
+            if (isset($_POST['source_query'])) {
+                $input['source_query'] = wp_unslash((string) $_POST['source_query']);
+            } elseif (isset($_GET['source_query'])) {
+                $input['source_query'] = wp_unslash((string) $_GET['source_query']);
+            }
+
+            if (! empty($input['source_query'])) {
+                $decoded = base64_decode((string) $input['source_query']);
+                if (false !== $decoded && '' !== $decoded) {
+                    $filters = [];
+                    parse_str($decoded, $filters);
+                    if (! empty($filters)) {
+                        $input['filters'] = $filters;
+                    }
+                }
+            }
+
+            if (isset($_POST['product_ids'])) {
+                $input['product_ids'] = wp_unslash((string) $_POST['product_ids']);
+            } elseif (isset($_GET['product_ids'])) {
+                $input['product_ids'] = wp_unslash((string) $_GET['product_ids']);
+            } elseif (isset($_POST['variant_product_id'])) {
+                $input['product_ids'] = wp_unslash((string) $_POST['variant_product_id']);
+            } elseif (isset($_GET['variant_product_id'])) {
+                $input['product_ids'] = wp_unslash((string) $_GET['variant_product_id']);
+            }
+
+            if (isset($_POST['variant_size_layer'])) {
+                $input['variant_size_layer'] = wp_unslash((string) $_POST['variant_size_layer']);
+            } elseif (isset($_GET['variant_size_layer'])) {
+                $input['variant_size_layer'] = wp_unslash((string) $_GET['variant_size_layer']);
+            }
+
+            if (isset($_POST['variant_colour_layer'])) {
+                $input['variant_colour_layer'] = wp_unslash((string) $_POST['variant_colour_layer']);
+            } elseif (isset($_GET['variant_colour_layer'])) {
+                $input['variant_colour_layer'] = wp_unslash((string) $_GET['variant_colour_layer']);
+            }
+
+            if (isset($_POST['preset_ids'])) {
+                $input['preset_ids'] = wp_unslash((string) $_POST['preset_ids']);
+            } elseif (isset($_GET['preset_ids'])) {
+                $input['preset_ids'] = wp_unslash((string) $_GET['preset_ids']);
+            }
+
+            if (isset($_POST['page_scope_ids'])) {
+                $input['page_scope_ids'] = wp_unslash((string) $_POST['page_scope_ids']);
+            } elseif (isset($_GET['page_scope_ids'])) {
+                $input['page_scope_ids'] = wp_unslash((string) $_GET['page_scope_ids']);
+            }
+
+            if (isset($_POST['range_start_id'])) {
+                $input['range_start_id'] = wp_unslash((string) $_POST['range_start_id']);
+            } elseif (isset($_GET['range_start_id'])) {
+                $input['range_start_id'] = wp_unslash((string) $_GET['range_start_id']);
+            } elseif (isset($_POST['range_start'])) {
+                $input['range_start'] = wp_unslash((string) $_POST['range_start']);
+            } elseif (isset($_GET['range_start'])) {
+                $input['range_start'] = wp_unslash((string) $_GET['range_start']);
+            }
+
+            if (isset($_POST['range_limit'])) {
+                $input['range_limit'] = wp_unslash($_POST['range_limit']);
+            } elseif (isset($_GET['range_limit'])) {
+                $input['range_limit'] = wp_unslash($_GET['range_limit']);
+            }
+
+            if (isset($_POST['export_all'])) {
+                $input['export_all'] = wp_unslash($_POST['export_all']);
+            } elseif (isset($_GET['export_all'])) {
+                $input['export_all'] = wp_unslash($_GET['export_all']);
+            }
+
+            return $this->prepare_export_context($input);
+        }
+
 
         /**
          * Handle the CSV export request.
@@ -704,12 +1355,13 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             $page_ids     = $context['page_ids'];
             $range_start = isset($context['range_start']) ? (int) $context['range_start'] : 0;
             $range_limit = isset($context['range_limit']) ? (int) $context['range_limit'] : 0;
+            $product_ids  = isset($context['product_ids']) ? (array) $context['product_ids'] : [];
 
             if ($range_start > 0 && $range_limit <= 0) {
                 $range_limit = 200;
             }
 
-            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit);
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit, $product_ids);
             $presets    = $this->fetch_presets($query_args, $range_start > 0 ? $range_start : null);
 
             if (empty($presets)) {
@@ -783,12 +1435,13 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             $page_ids     = $context['page_ids'];
             $range_start = isset($context['range_start']) ? (int) $context['range_start'] : 0;
             $range_limit = isset($context['range_limit']) ? (int) $context['range_limit'] : 0;
+            $product_ids  = isset($context['product_ids']) ? (array) $context['product_ids'] : [];
 
             if ($range_start > 0 && $range_limit <= 0) {
                 $range_limit = 200;
             }
 
-            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit);
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit, $product_ids);
             $presets    = $this->fetch_presets($query_args, $range_start > 0 ? $range_start : null);
 
             if (empty($presets)) {
@@ -827,6 +1480,142 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
         }
 
         /**
+         * Handle bulk deletion of presets based on modal configuration.
+         */
+        public function handle_bulk_delete(): void
+        {
+            if (! current_user_can(self::CAPABILITY)) {
+                wp_die(
+                    esc_html__('You do not have permission to delete presets.', 'mkl-pc-shopify-export'),
+                    esc_html__('Forbidden', 'mkl-pc-shopify-export'),
+                    ['response' => 403]
+                );
+            }
+
+            check_admin_referer(self::DELETE_NONCE_ACTION);
+
+            $redirect = wp_get_referer();
+            if (! $redirect) {
+                $redirect = admin_url('edit.php?post_type=mkl_pc_configuration');
+            }
+
+            $input   = wp_unslash($_POST);
+            $context = $this->prepare_export_context(is_array($input) ? $input : []);
+
+            $scope        = $context['scope'];
+            $per_page     = $context['per_page'];
+            $paged        = $context['paged'];
+            $filters      = $context['filters'];
+            $selected_ids = $context['selected_ids'];
+            $page_ids     = $context['page_ids'];
+            $range_start  = $context['range_start'];
+            $range_limit  = $context['range_limit'];
+            $product_ids  = $context['product_ids'];
+
+            $delete_permanently = ! empty($input['delete_permanently']);
+
+            if ('selection' === $scope && empty($selected_ids)) {
+                $this->send_delete_redirect([
+                    'deleted'   => 0,
+                    'failed'    => 0,
+                    'permanent' => $delete_permanently ? 1 : 0,
+                    'type'      => 'error',
+                    'message'   => esc_html__('Select at least one preset before performing a bulk deletion.', 'mkl-pc-shopify-export'),
+                ], $redirect);
+            }
+
+            if ('range' === $scope && $range_start <= 0) {
+                $this->send_delete_redirect([
+                    'deleted'   => 0,
+                    'failed'    => 0,
+                    'permanent' => $delete_permanently ? 1 : 0,
+                    'type'      => 'error',
+                    'message'   => esc_html__('Provide a valid starting preset ID when using range deletion.', 'mkl-pc-shopify-export'),
+                ], $redirect);
+            }
+
+            $query_args = $this->build_query_args($filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit, $product_ids);
+            $presets    = $this->fetch_presets($query_args, $range_start > 0 ? $range_start : null);
+
+            if (empty($presets)) {
+                $this->send_delete_redirect([
+                    'deleted'   => 0,
+                    'failed'    => 0,
+                    'permanent' => $delete_permanently ? 1 : 0,
+                    'type'      => 'warning',
+                    'message'   => esc_html__('No presets matched the chosen scope and filters, so nothing was deleted.', 'mkl-pc-shopify-export'),
+                ], $redirect);
+            }
+
+            if (! function_exists('wp_delete_post')) {
+                $this->send_delete_redirect([
+                    'deleted'   => 0,
+                    'failed'    => count($presets),
+                    'permanent' => $delete_permanently ? 1 : 0,
+                    'type'      => 'error',
+                    'message'   => esc_html__('WordPress deletion APIs are unavailable.', 'mkl-pc-shopify-export'),
+                ], $redirect);
+            }
+
+            $deleted    = 0;
+            $failed     = 0;
+            $failed_ids = [];
+
+            set_time_limit(0);
+
+            foreach ($presets as $preset_post) {
+                if (! $preset_post instanceof \WP_Post) {
+                    continue;
+                }
+
+                $result = wp_delete_post($preset_post->ID, (bool) $delete_permanently);
+
+                if ($result) {
+                    $deleted++;
+                } else {
+                    $failed++;
+                    $failed_ids[] = (int) $preset_post->ID;
+                }
+            }
+
+            $success_message = '';
+            if ($deleted > 0) {
+                if ($delete_permanently) {
+                    $success_message = sprintf(
+                        /* translators: %d: number of presets permanently deleted */
+                        _n('Permanently deleted %d preset.', 'Permanently deleted %d presets.', $deleted, 'mkl-pc-shopify-export'),
+                        $deleted
+                    );
+                } else {
+                    $success_message = sprintf(
+                        /* translators: %d: number of presets moved to the bin */
+                        _n('Moved %d preset to the bin.', 'Moved %d presets to the bin.', $deleted, 'mkl-pc-shopify-export'),
+                        $deleted
+                    );
+                }
+            } else {
+                $success_message = esc_html__('No presets were deleted.', 'mkl-pc-shopify-export');
+            }
+
+            if ($failed > 0) {
+                $success_message .= ' ' . sprintf(
+                    /* translators: %d: number of presets that failed to delete */
+                    _n('Failed to delete %d preset.', 'Failed to delete %d presets.', $failed, 'mkl-pc-shopify-export'),
+                    $failed
+                );
+            }
+
+            $this->send_delete_redirect([
+                'deleted'     => $deleted,
+                'failed'      => $failed,
+                'failed_ids'  => $failed_ids,
+                'permanent'   => $delete_permanently ? 1 : 0,
+                'type'        => $failed > 0 ? 'warning' : 'success',
+                'message'     => $success_message,
+            ], $redirect);
+        }
+
+        /**
          * Deny unauthenticated access to the export endpoint.
          */
         public function deny_non_privileged(): void
@@ -847,9 +1636,10 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          * @param int    $per_page
          * @param int    $paged
          * @param array<int> $page_ids
+         * @param array<int> $product_ids
          * @return array
          */
-        private function build_query_args(array $filters, array $selected_ids, string $scope, int $per_page, int $paged, array $page_ids = [], int $range_start = 0, int $range_limit = 0): array
+        private function build_query_args(array $filters, array $selected_ids, string $scope, int $per_page, int $paged, array $page_ids = [], int $range_start = 0, int $range_limit = 0, array $product_ids = []): array
         {
             $args = [
                 'post_type'      => 'mkl_pc_configuration',
@@ -913,7 +1703,7 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 }
             }
 
-            foreach (['post_parent', 'product_id', 'parent', 'post_parent_id', 'mkl_pc_product'] as $key) {
+            foreach (['post_parent', 'product_id', 'parent', 'post_parent_id', 'mkl_pc_product', 'mkl_pc_product_id'] as $key) {
                 if (! empty($filters[$key])) {
                     $args['post_parent'] = absint($filters[$key]);
                     break;
@@ -951,6 +1741,26 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
                 $args['tax_query'] = $tax_query;
             }
 
+            if (! empty($product_ids)) {
+                $product_ids = array_values(array_unique(array_map('absint', $product_ids)));
+                $product_ids = array_filter($product_ids);
+
+                if (! empty($product_ids)) {
+                    if (isset($args['post_parent__in']) && is_array($args['post_parent__in'])) {
+                        $args['post_parent__in'] = array_values(array_intersect($args['post_parent__in'], $product_ids));
+                    } elseif (isset($args['post_parent'])) {
+                        $args['post_parent__in'] = array_values(array_intersect([$args['post_parent']], $product_ids));
+                        unset($args['post_parent']);
+                    } else {
+                        $args['post_parent__in'] = $product_ids;
+                    }
+
+                    if (isset($args['post_parent__in']) && empty($args['post_parent__in'])) {
+                        $args['post_parent__in'] = [-1];
+                    }
+                }
+            }
+
             /**
              * Filter the query arguments used to fetch presets for export.
              *
@@ -963,8 +1773,32 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
          * @param array<int> $page_ids IDs captured for the current page scope.
          * @param int    $range_start  Starting preset ID when range scope is active.
          * @param int    $range_limit  Number of presets to export when range scope is active.
+         * @param array<int> $product_ids Explicitly limited parent product IDs.
          */
-            return apply_filters('mkl_pc_preset_export_query_args', $args, $filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit);
+            return apply_filters('mkl_pc_preset_export_query_args', $args, $filters, $selected_ids, $scope, $per_page, $paged, $page_ids, $range_start, $range_limit, $product_ids);
+        }
+
+        /**
+         * Encode deletion feedback and redirect back to the presets list.
+         *
+         * @param array<string,mixed> $data
+         * @param string              $redirect
+         */
+        private function send_delete_redirect(array $data, string $redirect): void
+        {
+            $encoded = '';
+            $json    = wp_json_encode($data);
+
+            if (false !== $json) {
+                $encoded = base64_encode($json);
+            }
+
+            if ($encoded) {
+                $redirect = add_query_arg(self::DELETE_NOTICE_QUERY_ARG, rawurlencode($encoded), $redirect);
+            }
+
+            wp_safe_redirect($redirect);
+            exit;
         }
 
         /**
@@ -1303,6 +2137,76 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
             if (function_exists('update_post_caches')) {
                 update_post_caches($presets, 'mkl_pc_configuration', false, true);
             }
+        }
+
+        /**
+         * Stream export rows to the provided consumer callback.
+         *
+         * @param array<string,mixed> $context Normalised export context.
+         * @param string              $format  Export format identifier.
+         * @param callable            $row_consumer Callback receiving each row.
+         * @return array{rows:int,presets:int}
+         */
+        private function stream_export_rows(array $context, string $format, callable $row_consumer): array
+        {
+            $format       = strtolower($format);
+            $validFormats = ['shopify', 'raw'];
+            if (! in_array($format, $validFormats, true)) {
+                $format = 'shopify';
+            }
+
+            $scope        = $context['scope'] ?? 'page';
+            $per_page     = $context['per_page'] ?? 20;
+            $paged        = $context['paged'] ?? 1;
+            $filters      = $context['filters'] ?? [];
+            $selected_ids = $context['selected_ids'] ?? [];
+            $page_ids     = $context['page_ids'] ?? [];
+            $range_start  = isset($context['range_start']) ? (int) $context['range_start'] : 0;
+            $range_limit  = isset($context['range_limit']) ? (int) $context['range_limit'] : 0;
+            $product_ids  = isset($context['product_ids']) ? (array) $context['product_ids'] : [];
+
+            $query_args = $this->build_query_args($filters, $selected_ids, (string) $scope, (int) $per_page, (int) $paged, (array) $page_ids, $range_start, $range_limit, $product_ids);
+            $presets    = $this->fetch_presets($query_args, $range_start > 0 ? $range_start : null);
+            $preset_count = count($presets);
+
+            if (0 === $preset_count) {
+                return ['rows' => 0, 'presets' => 0];
+            }
+
+            $this->prime_preset_caches($presets);
+
+            if ('raw' === $format) {
+                $row_count = 0;
+                $consumer = function (array $row) use (&$row_count, $row_consumer) {
+                    $row_count++;
+                    $row_consumer($row);
+                };
+
+                $this->build_raw_export_rows($presets, $consumer);
+
+                return [
+                    'rows'    => $row_count,
+                    'presets' => $preset_count,
+                ];
+            }
+
+            $grouped = $this->group_presets_by_product($presets);
+            if (empty($grouped)) {
+                return ['rows' => 0, 'presets' => $preset_count];
+            }
+
+            $row_count = 0;
+            $consumer = function (array $row) use (&$row_count, $row_consumer) {
+                $row_count++;
+                $row_consumer($row);
+            };
+
+            $this->process_shopify_groups($grouped, $consumer);
+
+            return [
+                'rows'    => $row_count,
+                'presets' => $preset_count,
+            ];
         }
 
         /**
@@ -2648,6 +3552,6 @@ if (! class_exists('MKL_PC_Preset_Shopify_Export')) {
     }
 }
 
-if (is_admin()) {
+if (is_admin() || (defined('WP_CLI') && WP_CLI)) {
     MKL_PC_Preset_Shopify_Export::instance();
 }
